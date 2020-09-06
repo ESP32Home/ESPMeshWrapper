@@ -3,7 +3,7 @@
 
 #include <EspMeshWrapper.h>
 
-//see guthub repo readme for example config files and expected output log :
+//see github repo readme for example config files and expected output log :
 //https://github.com/ESP32Home/ESPMeshWrapper/blob/master/README.md
 
 DynamicJsonDocument config(5*1024);//5 KB
