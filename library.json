@@ -1,0 +1,19 @@
+{
+    "name": "ESPMeshWrapper",
+    "version" : "1.0.0",
+    "description" : "An ESP-MESH wrapper library for an Arduino like API and using json files for runtime configuration",
+    "keywords" : "mesh, routing, wifi, json, config, spiffs",
+    "license" : "MIT",
+    "repository":{
+        "type" : "git",
+        "url" : "https://github.com/ESP32Home/ESPMeshWrapper.git"
+    },
+    "authors":{
+        "name" : "wassfila",
+        "url": "https://github.com/wassfila"
+    },
+    "dependencies":{
+    },
+    "frameworks" : "arduino",
+    "platforms" : "espressif32"
+}
