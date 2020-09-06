@@ -1,6 +1,6 @@
 {
     "name": "ESPMeshWrapper",
-    "version" : "1.0.0",
+    "version" : "1.0.1",
     "description" : "An ESP-MESH wrapper library for an Arduino like API and using json files for runtime configuration",
     "keywords" : "mesh, routing, wifi, json, config, spiffs",
     "license" : "MIT",
