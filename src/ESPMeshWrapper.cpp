@@ -16,6 +16,7 @@ static mesh_addr_t mesh_parent_addr;
 static int mesh_layer = -1;
 static uint8_t tx_buf[TX_SIZE] = { 0, };
 static uint8_t rx_buf[RX_SIZE] = { 0, };
+static uint8_t rx_ext_buf[RX_SIZE] = { 0, };
 static bool is_running = true;
 static bool is_comm_p2p_started = false;
 
@@ -48,6 +49,33 @@ void string_to_hextab(const char* str,mesh_addr_t &t){
     t.addr[5] = 0x77;
 }
 
+void string_to_ip_port(String str,mesh_addr_t &add){
+    int tp = str.indexOf(':');
+    int p1 = str.indexOf('.');
+    int p2 = str.indexOf('.',p1+1);
+    int p3 = str.indexOf('.',p2+1);
+    //Serial.printf("tp:%d p1,2,3:%d,%d,%d\n",tp,p1,p2,p3);
+
+    uint16_t port = str.substring(tp+1).toInt();
+    uint32_t ip1 = str.substring(0,p1).toInt();
+    uint32_t ip2 = str.substring(p1+1,p2).toInt();
+    uint32_t ip3 = str.substring(p2+1,p3).toInt();
+    uint32_t ip4 = str.substring(p3+1,tp).toInt();
+    //Serial.printf("port:%d ip1,2,3,4:%d,%d,%d,%d\n",port,ip1,ip2,ip3,ip4);
+
+    add.mip.port = port;
+    add.mip.ip4.addr = (ip1<<24) | (ip2<<16) | (ip3<<8) | (ip4);
+    //Serial.printf("ip hex 0x%02x\n",add.mip.ip4.addr);
+}
+
+void ip_port_to_string(mesh_addr_t add,String &str){
+    uint8_t u1 = (add.mip.ip4.addr>>24) & 0xff;
+    uint8_t u2 = (add.mip.ip4.addr>>16) & 0xff;
+    uint8_t u3 = (add.mip.ip4.addr>>8) & 0xff;
+    uint8_t u4 =  add.mip.ip4.addr & 0xff;
+    str = String(u1)+"."+String(u2)+"."+String(u3)+"."+String(u4)+":"+String(add.mip.port);
+}
+
 String hextab_to_string(uint8_t* add){
     String res;
     for(int i=0;i<5;i++){
@@ -66,9 +94,9 @@ void print_mac(uint8_t* add){
 }
 
 void print_ip(ip4_addr_t add){
-    uint8_t u1 = (add.addr>>3) & 0xff;
-    uint8_t u2 = (add.addr>>2) & 0xff;
-    uint8_t u3 = (add.addr>>1) & 0xff;
+    uint8_t u1 = (add.addr>>24) & 0xff;
+    uint8_t u2 = (add.addr>>16) & 0xff;
+    uint8_t u3 = (add.addr>>8) & 0xff;
     uint8_t u4 = add.addr & 0xff;
     Serial.printf("%d.%d.%d.%d\n",u1,u2,u3,u4);
 }
@@ -90,9 +118,45 @@ void esp_mesh_p2p_rx_main(void *arg)
             Serial.printf("error> 0x%x, size:%d\n", err, data.size);
             continue;
         }
+        if(data.size<RX_SIZE){
+            data.data[data.size] = 0;
+        }
         String result(reinterpret_cast<char*>(data.data));
         String from_text = hextab_to_string(from.addr);
         message_callback(result,from_text,flag);
+    }
+    vTaskDelete(NULL);
+}
+
+void esp_mesh_ext_rx_main(void *arg)
+{
+    esp_err_t err;
+    mesh_addr_t from_add;
+    mesh_addr_t to_add;
+    mesh_data_t data;
+    int flag = 0;
+    data.data = rx_ext_buf;
+    data.size = RX_SIZE;
+
+    while (is_comm_ext_started && is_mesh_connected) {
+        data.size = RX_SIZE;
+        err = esp_mesh_recv_toDS(&from_add,&to_add, &data, portMAX_DELAY, &flag, NULL, 0);
+        if (err != ESP_OK || !data.size) {
+            if(err != ESP_ERR_MESH_TIMEOUT){//otherwise don't bother with notifications for timeouts
+                Serial.printf("error> 0x%x, size:%d\n", err, data.size);
+            }
+            continue;
+        }
+        if(data.size<RX_SIZE){//null termination for strings
+            data.data[data.size] = 0;
+        }
+        String result(reinterpret_cast<char*>(data.data));
+        String to_add_text;
+        ip_port_to_string(to_add,to_add_text);
+        Serial.printf("  message to external ip : %s\n",to_add_text.c_str());
+        Serial.print("  => "+result);
+        //String from_text = hextab_to_string(from_add.addr);
+        //message_callback(result,from_text,flag);
     }
     vTaskDelete(NULL);
 }
@@ -109,7 +173,23 @@ esp_err_t esp_mesh_comm_p2p_start(void)
 esp_err_t esp_mesh_comm_p2p_stop(void)
 {
     is_running = false;//the task will delete itself
-    is_comm_p2p_started = false;//so that it can be created next time
+    is_comm_p2p_started = false;//so that it can be created next time after next receive
+    return ESP_OK;
+}
+
+esp_err_t esp_mesh_comm_ext_start(void)
+{
+    if (!is_comm_ext_started) {
+        is_comm_ext_started = true;
+        xTaskCreate(esp_mesh_ext_rx_main, "ETRX", 3072, NULL, 5, NULL);
+    }
+    return ESP_OK;
+}
+
+//will simply stop with "is_mesh_connected == false"
+esp_err_t esp_mesh_comm_ext_stop(void)
+{
+    is_comm_ext_started = false;//the task will delete itself within timeout
     return ESP_OK;
 }
 
@@ -169,6 +249,10 @@ void mesh_event_handler(mesh_event_t event)
             tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
         }
         esp_mesh_comm_p2p_start();
+        //after esp_mesh_comm_p2p_start()
+        if (esp_mesh_is_root()) {
+            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
+        }
         break;
     case MESH_EVENT_PARENT_DISCONNECTED:
         Serial.printf("<MESH_EVENT_PARENT_DISCONNECTED>reason:%d\n",event.info.disconnected.reason);
@@ -183,6 +267,9 @@ void mesh_event_handler(mesh_event_t event)
                  esp_mesh_is_root() ? "<ROOT>" :
                  (mesh_layer == 2) ? "<layer2>\n" : "\n");
         last_layer = mesh_layer;
+        if (esp_mesh_is_root()) {
+            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
+        }
         break;
     case MESH_EVENT_ROOT_ADDRESS:
         Serial.printf("<MESH_EVENT_ROOT_ADDRESS>root address:");
@@ -218,6 +305,9 @@ void mesh_event_handler(mesh_event_t event)
         esp_mesh_get_parent_bssid(&mesh_parent_addr);
         Serial.printf("<MESH_EVENT_ROOT_SWITCH_ACK>layer:%d, parent:", mesh_layer);
         print_mac(mesh_parent_addr.addr);
+        if (esp_mesh_is_root()) {
+            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
+        }
         break;
     case MESH_EVENT_TODS_STATE:
         Serial.printf("<MESH_EVENT_TODS_REACHABLE>state:%d\n",event.info.toDS_state);
@@ -373,22 +463,85 @@ bool MeshApp::send_down(String message){
                         mesh_layer,esp_get_minimum_free_heap_size(),err, data.proto, data.tos);
             print_mac(mesh_parent_addr.addr);
             print_mac(route_table[i].addr);
-            continue;
+            return false;
         }
     }
     return true;
 }
 
+bool MeshApp::send_parent(String message){
+    esp_err_t err;
+    mesh_data_t data;
+    data.data = tx_buf;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+    if(!is_running){
+        return false;
+    }
+
+    string_to_char_len(message,data.data,data.size);
+
+    if(esp_mesh_is_root()){
+        Serial.printf("  error>Node is ROOT, can't send to parent router\n");
+        return false;
+    }
+
+    Serial.printf("  Sending to Parent :");
+    print_mac(mesh_parent_addr.addr);
+
+    err = esp_mesh_send(&mesh_parent_addr, &data, MESH_DATA_P2P, NULL, 0);
+    if (err) {
+        Serial.printf("  error:0x%x>[Layer:%d] [heap:%d] [proto:%d, tos:%d] *parent\n",
+                    err,mesh_layer,esp_get_minimum_free_heap_size(),data.proto, data.tos);
+        print_mac(mesh_parent_addr.addr);
+        return false;
+    }
+    return true;
+}
+
+bool MeshApp::send_out(String ip_port,String message){
+    esp_err_t err;
+    mesh_data_t data;
+    data.data = tx_buf;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;        //Type Of Service, Point 2 Point reliable
+    int flag = MESH_DATA_TODS;      //To external IP
+    mesh_addr_t ext_addr;
+
+    if(!is_running){
+        return false;
+    }
+
+    string_to_ip_port(ip_port,ext_addr);
+    string_to_char_len(message,data.data,data.size);
+    
+    Serial.printf("  Sending to external address : %s\n",ip_port.c_str());
+
+    err = esp_mesh_send(&ext_addr, &data, flag, NULL, 0);
+    if (err) {
+        String used_addr;
+        ip_port_to_string(ext_addr,used_addr);
+        Serial.printf("  error:0x%x>[Layer:%d] [heap:%d] [proto:%d, tos:%d] =>(%s)\n",
+                    err,mesh_layer,esp_get_minimum_free_heap_size(),data.proto, data.tos,used_addr.c_str());
+        return false;
+    }else{
+        Serial.printf("  esp_mesh_send ESP_OK\n");
+        return true;
+    }
+}
+
 void MeshApp::print_info(){
     esp_err_t err;
     String info;
-    info = "*Layer="+String(esp_mesh_get_layer());
+
+    info = "Layer="+String(esp_mesh_get_layer());
+
+    info += is_mesh_connected?" 'connected'":" 'not connected'";
 
     mesh_addr_t bssid;
     err = esp_mesh_get_parent_bssid(&bssid);
     if(err == ESP_OK){
         info += " Parent="+hextab_to_string(bssid.addr)+" ";
-
     }
     if(!esp_mesh_is_root()){
         info += " Not";
@@ -397,7 +550,13 @@ void MeshApp::print_info(){
 
     info += "NbNodes="+String(esp_mesh_get_total_node_num());
     info += "  TableSize="+String(esp_mesh_get_routing_table_size());
-
+    mesh_rx_pending_t pending;
+    esp_mesh_get_rx_pending(&pending);
+    info += "  pending toDS="+String(pending.toDS)+" toSelf"+String(pending.toSelf);
 
     Serial.println(info);
+}
+
+bool MeshApp::connected(){
+    return is_mesh_connected;
 }
