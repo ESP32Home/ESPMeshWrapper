@@ -7,6 +7,14 @@
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
+
+#include "esp_log.h"
+#include "mqtt_client.h"
+
 #define RX_SIZE          (1500)
 #define TX_SIZE          (1460)
 #define CONFIG_MESH_ROUTE_TABLE_SIZE_MAX 50
@@ -22,6 +30,15 @@ static bool is_comm_p2p_started = false;
 
 //reduced to singleton instance as the path such as mesh_event_handler, does not have data
 MeshCallback message_callback = nullptr;
+const TickType_t delay_one_second = 1000 / portTICK_PERIOD_MS;
+
+esp_mqtt_client_handle_t g_client;
+
+void string_to_char_len(String str,uint8_t* text,uint8_t &length){
+    length = str.length();
+    memcpy(text, str.c_str(), length);
+    text[length] = '\0';//clean ending for printing
+}
 
 void string_to_char_len(String str,uint8_t* text,uint16_t &length){
     length = str.length();
@@ -29,7 +46,7 @@ void string_to_char_len(String str,uint8_t* text,uint16_t &length){
     text[length] = '\0';//clean ending for printing
 }
 
-void string_to_char_len(String str,uint8_t* text,uint8_t &length){
+void string_to_char_len(String str,uint8_t* text,uint32_t &length){
     length = str.length();
     memcpy(text, str.c_str(), length);
     text[length] = '\0';//clean ending for printing
@@ -85,6 +102,53 @@ String hextab_to_string(uint8_t* add){
     return res;
 }
 
+static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
+{
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+    // your_context_t *context = event->context;
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+            msg_id = esp_mqtt_client_publish(client, "/topic/qos1", "data_3", 0, 1, 0);
+            ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+
+            msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
+            ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+            msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
+            ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+            msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
+            ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+            break;
+
+        case MQTT_EVENT_SUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+            msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
+            ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+            break;
+        case MQTT_EVENT_UNSUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_PUBLISHED:
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_DATA:
+            ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+            printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+            printf("DATA=%.*s\r\n", event->data_len, event->data);
+            break;
+        case MQTT_EVENT_ERROR:
+            ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+            break;
+    }
+    return ESP_OK;
+}
+
 
 void print_mac(uint8_t* add){
     for(int i=0;i<5;i++){
@@ -99,6 +163,26 @@ void print_ip(ip4_addr_t add){
     uint8_t u3 = (add.addr>>8) & 0xff;
     uint8_t u4 = add.addr & 0xff;
     Serial.printf("%d.%d.%d.%d\n",u1,u2,u3,u4);
+}
+
+void send_udp(String ip_port,String message){
+    uint8_t* payload = tx_buf;
+    uint32_t size;
+    struct sockaddr_in destAddr;
+    destAddr.sin_addr.s_addr = inet_addr("10.0.0.31");
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(867);
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+    string_to_char_len(message,payload,size);
+    int err = sendto(sock, payload, size, 0, (struct sockaddr *)&destAddr, sizeof(destAddr));
+
+    if (err < 0) {
+        Serial.printf("Error occured during sending: errno %d\n", errno);
+    }else{
+        Serial.printf("Message sent %d bytes\n",size);
+    }
+
 }
 
 void esp_mesh_p2p_rx_main(void *arg)
@@ -135,29 +219,67 @@ void esp_mesh_ext_rx_main(void *arg)
     mesh_addr_t to_add;
     mesh_data_t data;
     int flag = 0;
+    int one_second = 1000;
     data.data = rx_ext_buf;
     data.size = RX_SIZE;
 
-    while (is_comm_ext_started && is_mesh_connected) {
-        data.size = RX_SIZE;
-        err = esp_mesh_recv_toDS(&from_add,&to_add, &data, portMAX_DELAY, &flag, NULL, 0);
-        if (err != ESP_OK || !data.size) {
-            if(err != ESP_ERR_MESH_TIMEOUT){//otherwise don't bother with notifications for timeouts
-                Serial.printf("error> 0x%x, size:%d\n", err, data.size);
+    while(is_running){
+        if(is_mesh_connected && esp_mesh_is_root()){
+            data.size = RX_SIZE;
+            err = esp_mesh_recv_toDS(&from_add,&to_add, &data, one_second, &flag, NULL, 0);
+            if (err != ESP_OK || !data.size) {
+                if(err != ESP_ERR_MESH_TIMEOUT){
+                    Serial.printf("error> 0x%x, size:%d\n", err, data.size);
+                }//else don't bother with notifications for timeouts
+            }else{
+                if(data.size<RX_SIZE){//null termination for strings
+                    data.data[data.size] = 0;
+                }
+                String result(reinterpret_cast<char*>(data.data));
+                String to_add_text;
+                ip_port_to_string(to_add,to_add_text);
+                Serial.printf("  message to external ip : %s\n",to_add_text.c_str());
+                Serial.print("  => "+result);
+                send_udp(to_add_text,result);
             }
-            continue;
+        }else{
+            vTaskDelay(delay_one_second);
         }
-        if(data.size<RX_SIZE){//null termination for strings
-            data.data[data.size] = 0;
-        }
-        String result(reinterpret_cast<char*>(data.data));
-        String to_add_text;
-        ip_port_to_string(to_add,to_add_text);
-        Serial.printf("  message to external ip : %s\n",to_add_text.c_str());
-        Serial.print("  => "+result);
-        //String from_text = hextab_to_string(from_add.addr);
-        //message_callback(result,from_text,flag);
     }
+
+    vTaskDelete(NULL);
+}
+
+
+char mqtt_uri[32];
+
+void esp_mqtt_main(void *arg)
+{
+    esp_err_t err;
+
+    esp_mqtt_client_config_t mqtt_cfg;
+    memset(&mqtt_cfg,0,sizeof(esp_mqtt_client_config_t));
+    strcpy(mqtt_uri,"mqtt://10.0.0.42:1884");
+    mqtt_cfg.uri = mqtt_uri;
+    mqtt_cfg.event_handle = mqtt_event_handler;
+
+    g_client = esp_mqtt_client_init(&mqtt_cfg);
+    err = esp_mqtt_client_start(g_client);
+        if(err != ESP_OK)Serial.printf("esp_mqtt_client_start: 0x%X\n",err);
+
+    //E (175588) MQTT_CLIENT: Error transport connect
+    //186862 : loop start cycle (38)
+
+    //mesh: Layer=1 'connected' Parent=2c:30:33:9c:bf:c0  root  NbNodes=1  TableSize=1  pending toDS=0 toSelf0
+    //route table size = 1
+    //  Sending to 80:7D:3A:D5:2F:CC
+    //RX> from(80:7d:3a:d5:2f:cc) => [Hello dowlink neighbors (38)]
+    //E (190786) MQTT_CLIENT: mqtt_message_receive: received a message with an invalid header=0x48
+    //E (190787) MQTT_CLIENT: esp_mqtt_connect: mqtt_message_receive() returned -1    
+
+    //while (is_running) {
+    //    vTaskDelay(delay_one_second);
+    //}
     vTaskDelete(NULL);
 }
 
@@ -166,6 +288,10 @@ esp_err_t esp_mesh_comm_p2p_start(void)
     if (!is_comm_p2p_started) {
         is_comm_p2p_started = true;
         xTaskCreate(esp_mesh_p2p_rx_main, "MPRX", 3072, NULL, 5, NULL);
+        xTaskCreate(esp_mesh_ext_rx_main, "ETRX", 3072, NULL, 5, NULL);
+        
+        //MQTT gateway fail
+        //xTaskCreate(esp_mqtt_main, "MQTT", 3072, NULL, 5, NULL);
     }
     return ESP_OK;
 }
@@ -174,22 +300,6 @@ esp_err_t esp_mesh_comm_p2p_stop(void)
 {
     is_running = false;//the task will delete itself
     is_comm_p2p_started = false;//so that it can be created next time after next receive
-    return ESP_OK;
-}
-
-esp_err_t esp_mesh_comm_ext_start(void)
-{
-    if (!is_comm_ext_started) {
-        is_comm_ext_started = true;
-        xTaskCreate(esp_mesh_ext_rx_main, "ETRX", 3072, NULL, 5, NULL);
-    }
-    return ESP_OK;
-}
-
-//will simply stop with "is_mesh_connected == false"
-esp_err_t esp_mesh_comm_ext_stop(void)
-{
-    is_comm_ext_started = false;//the task will delete itself within timeout
     return ESP_OK;
 }
 
@@ -249,10 +359,6 @@ void mesh_event_handler(mesh_event_t event)
             tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
         }
         esp_mesh_comm_p2p_start();
-        //after esp_mesh_comm_p2p_start()
-        if (esp_mesh_is_root()) {
-            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
-        }
         break;
     case MESH_EVENT_PARENT_DISCONNECTED:
         Serial.printf("<MESH_EVENT_PARENT_DISCONNECTED>reason:%d\n",event.info.disconnected.reason);
@@ -267,9 +373,6 @@ void mesh_event_handler(mesh_event_t event)
                  esp_mesh_is_root() ? "<ROOT>" :
                  (mesh_layer == 2) ? "<layer2>\n" : "\n");
         last_layer = mesh_layer;
-        if (esp_mesh_is_root()) {
-            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
-        }
         break;
     case MESH_EVENT_ROOT_ADDRESS:
         Serial.printf("<MESH_EVENT_ROOT_ADDRESS>root address:");
@@ -305,9 +408,6 @@ void mesh_event_handler(mesh_event_t event)
         esp_mesh_get_parent_bssid(&mesh_parent_addr);
         Serial.printf("<MESH_EVENT_ROOT_SWITCH_ACK>layer:%d, parent:", mesh_layer);
         print_mac(mesh_parent_addr.addr);
-        if (esp_mesh_is_root()) {
-            esp_mesh_comm_ext_start();//will stop when is_mesh_connected <= false
-        }
         break;
     case MESH_EVENT_TODS_STATE:
         Serial.printf("<MESH_EVENT_TODS_REACHABLE>state:%d\n",event.info.toDS_state);
@@ -376,9 +476,14 @@ bool MeshApp::start(DynamicJsonDocument &config,DynamicJsonDocument &secret){
     err = esp_wifi_start();
         if(err != ESP_OK)Serial.printf("esp_wifi_start: 0x%X\n",err);
 
+    //----------------------    Mesh    ----------------------
+
     err = esp_mesh_init();
         if(err != ESP_OK)Serial.printf("esp_mesh_init: 0x%X\n",err);
     
+    const char* idf_version = esp_get_idf_version();
+    Serial.printf("idf> version = %s\n",idf_version);   //v3.2.3-14-gd3e562907
+    //IDF_VER
     //esp_mesh_set_topology()               // Not available in 3.3
     //esp_mesh_set_active_duty_cycle()      // Not available in 3.3
 
@@ -511,30 +616,33 @@ bool MeshApp::send_out(String ip_port,String message){
     if(!is_running){
         return false;
     }
-
-    string_to_ip_port(ip_port,ext_addr);
-    string_to_char_len(message,data.data,data.size);
     
-    Serial.printf("  Sending to external address : %s\n",ip_port.c_str());
-
-    err = esp_mesh_send(&ext_addr, &data, flag, NULL, 0);
-    if (err) {
-        String used_addr;
-        ip_port_to_string(ext_addr,used_addr);
-        Serial.printf("  error:0x%x>[Layer:%d] [heap:%d] [proto:%d, tos:%d] =>(%s)\n",
-                    err,mesh_layer,esp_get_minimum_free_heap_size(),data.proto, data.tos,used_addr.c_str());
-        return false;
+    if(esp_mesh_is_root()){
+        send_udp(ip_port,message);
     }else{
-        Serial.printf("  esp_mesh_send ESP_OK\n");
-        return true;
+        string_to_ip_port(ip_port,ext_addr);
+        string_to_char_len(message,data.data,data.size);
+        Serial.printf("  Sending to external address : %s\n",ip_port.c_str());
+        err = esp_mesh_send(&ext_addr, &data, flag, NULL, 0);
+        if (err) {
+            String used_addr;
+            ip_port_to_string(ext_addr,used_addr);
+            Serial.printf("  error:0x%x>[Layer:%d] [heap:%d] [proto:%d, tos:%d] =>(%s)\n",
+                        err,mesh_layer,esp_get_minimum_free_heap_size(),data.proto, data.tos,used_addr.c_str());
+            return false;
+        }else{
+            Serial.printf("  esp_mesh_send ESP_OK\n");
+            return true;
+        }
     }
+    return true;
 }
 
 void MeshApp::print_info(){
     esp_err_t err;
     String info;
 
-    info = "Layer="+String(esp_mesh_get_layer());
+    info = "mesh: Layer="+String(esp_mesh_get_layer());
 
     info += is_mesh_connected?" 'connected'":" 'not connected'";
 
@@ -559,4 +667,8 @@ void MeshApp::print_info(){
 
 bool MeshApp::connected(){
     return is_mesh_connected;
+}
+
+bool MeshApp::is_root(){
+    return esp_mesh_is_root();
 }

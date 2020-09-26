@@ -11,4 +11,5 @@ class MeshApp{
         bool send_parent(String message);
         bool send_out(String ip_port,String message);
         void print_info();
+        bool is_root();
 };
